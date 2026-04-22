@@ -23,6 +23,7 @@ Usage:
 """
 
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -171,6 +172,76 @@ class JsonEvalRunner(ParallelRolloutRunner):
     # =========================================================================
     # Hook Overrides - Customize episode processing for JSON benchmarks
     # =========================================================================
+
+    @staticmethod
+    def build_work_items(
+        exp_config: MlSpacesExpConfig,
+        house_indices: list[int],
+        samples_per_house: int,
+    ) -> list[dict]:
+        """
+        Build work items for JSON eval, optionally splitting each house into
+        multiple batches so different workers can share the load for a single
+        house (useful to bound peak memory with many episodes per house).
+
+        Batch size is controlled by env var MLSPACES_JSON_EVAL_EPISODES_PER_BATCH.
+        When unset or <=0, one item per house (no batching).
+        """
+        # Load the benchmark to figure out how many episodes each house actually has.
+        benchmark_path = exp_config.benchmark_path
+        episodes_per_house: dict[int, int] = {}
+        try:
+            all_eps = load_all_episodes(benchmark_path) if benchmark_path is not None else []
+            for ep in all_eps:
+                episodes_per_house[int(ep.house_index)] = (
+                    episodes_per_house.get(int(ep.house_index), 0) + 1
+                )
+        except Exception as e:
+            log.warning(
+                f"JsonEvalRunner.build_work_items: failed to introspect benchmark at "
+                f"{benchmark_path}: {e}. Falling back to samples_per_house for every house."
+            )
+
+        per_batch_env = os.environ.get("MLSPACES_JSON_EVAL_EPISODES_PER_BATCH", "").strip()
+        try:
+            per_batch = int(per_batch_env) if per_batch_env else 0
+        except ValueError:
+            log.warning(
+                f"Invalid MLSPACES_JSON_EVAL_EPISODES_PER_BATCH='{per_batch_env}', "
+                "falling back to no batching."
+            )
+            per_batch = 0
+
+        work_items: list[dict] = []
+        for house_id in house_indices:
+            n = episodes_per_house.get(int(house_id), samples_per_house)
+            if n <= 0:
+                n = samples_per_house
+            if per_batch <= 0 or per_batch >= n:
+                work_items.append(
+                    {
+                        "house_id": int(house_id),
+                        "batch_num": 1,
+                        "total_batches": 1,
+                        "episode_start_idx": None,
+                        "episode_end_idx": None,
+                    }
+                )
+                continue
+            total_batches = (n + per_batch - 1) // per_batch
+            for b in range(total_batches):
+                s = b * per_batch
+                e = min(n, (b + 1) * per_batch)
+                work_items.append(
+                    {
+                        "house_id": int(house_id),
+                        "batch_num": b + 1,
+                        "total_batches": total_batches,
+                        "episode_start_idx": s,
+                        "episode_end_idx": e,
+                    }
+                )
+        return work_items
 
     @staticmethod
     def load_episodes_for_house(

@@ -1020,6 +1020,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
     def close(self) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
+        self._executor = None
 
         # clean up object managers
         for om in self.object_managers:
@@ -1028,6 +1029,44 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
         # Clean up camera renderers
         self.cleanup_rendering()
+
+        # Drop references to MuJoCo native objects so the underlying C allocations
+        # (mjModel/mjData and large buffers) can be reclaimed when the env is discarded.
+        # Without this, memory can accumulate across repeated scene loads.
+        try:
+            if hasattr(self, "_mj_datas") and self._mj_datas is not None:
+                self._mj_datas = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_robots") and self._robots is not None:
+                self._robots = None
+        except Exception:
+            pass
+        try:
+            self._mj_model = None
+        except Exception:
+            pass
+        try:
+            self._scene_metadata = None
+        except Exception:
+            pass
+        try:
+            self._mj_base_scene_path = None
+        except Exception:
+            pass
+        try:
+            # Clear cached occupancy map (can be large)
+            self._cached_thormap = None
+            self._cached_thormap_key = None
+        except Exception:
+            pass
+        try:
+            # Drop camera registry references (cameras can capture large arrays)
+            if hasattr(self, "camera_manager") and self.camera_manager is not None:
+                self.camera_manager.registry.cameras.clear()
+        except Exception:
+            pass
 
         # add garbage collection to ensure all resources are released
         gc.collect()

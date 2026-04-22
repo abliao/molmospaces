@@ -20,6 +20,7 @@ import mujoco
 import numpy as np
 import torch
 from mujoco import MjData, MjSpec
+import psutil
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.env.arena.arena_utils import get_all_bodies_with_joints_as_mlspaces_objects
@@ -207,6 +208,63 @@ from molmo_spaces.utils.lazy_loading_utils import install_scene_with_objects_and
 from molmo_spaces.utils.mujoco_scene_utils import randomize_door_joints
 
 log = logging.getLogger(__name__)
+
+
+def _should_log_memory() -> bool:
+    # Keep this switch consistent with pipeline.py
+    return bool(os.environ.get("MOLMO_LOG_MEMORY", ""))
+
+
+def _log_memory_usage(prefix: str = "") -> None:
+    if not _should_log_memory():
+        return
+    try:
+        rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        log.info(f"{prefix}Memory usage: {rss_mb:.2f} MB")
+    except Exception:
+        # Never break sampling due to logging
+        return
+
+
+def _format_bytes(n_bytes: int | None) -> str:
+    if n_bytes is None:
+        return "unknown"
+    mb = n_bytes / 1024 / 1024
+    if mb < 1024:
+        return f"{mb:.1f} MB"
+    return f"{mb / 1024:.2f} GB"
+
+
+def _estimate_env_native_bytes(env) -> tuple[int | None, int | None, int | None]:
+    """
+    Best-effort estimate of MuJoCo native allocations for an env:
+    - mjModel size (bytes)
+    - per-mjData size (bytes, derived from model)
+    - total (model + data*n_batch)
+
+    Notes:
+    - Does NOT include renderer/driver allocations.
+    - Requires MuJoCo Python bindings exposing mj_sizeModel/mj_sizeData (not guaranteed).
+    """
+    try:
+        model = getattr(env, "mj_model", None)
+        if model is None:
+            return None, None, None
+        size_model_fn = getattr(mujoco, "mj_sizeModel", None)
+        size_data_fn = getattr(mujoco, "mj_sizeData", None)
+        if size_model_fn is None or size_data_fn is None:
+            return None, None, None
+
+        model_bytes = int(size_model_fn(model))
+        data_bytes = int(size_data_fn(model))
+        try:
+            n_batch = len(getattr(env, "mj_datas", []))
+        except Exception:
+            n_batch = int(getattr(env, "n_batch", 0) or 0)
+        total_bytes = model_bytes + data_bytes * max(0, n_batch)
+        return model_bytes, data_bytes, total_bytes
+    except Exception:
+        return None, None, None
 
 
 class MetadataAdder:
@@ -717,8 +775,15 @@ class BaseMujocoTaskSampler:
         if scene_path is None:
             scene_path = self._current_house_scene_path(variant=variant)
 
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:start (scene={scene_path}) | "
+        )
+
         # Track asset installation time (fetching/extracting scene, objects, grasps)
         # Use detailed profiling to identify which asset type is slow
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:before_asset_install (scene={scene_path}) | "
+        )
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_asset_install")
             from molmo_spaces.utils.lazy_loading_utils import (
@@ -743,8 +808,14 @@ class BaseMujocoTaskSampler:
             self._datagen_profiler.end("scene_asset_install")
         else:
             install_scene_with_objects_and_grasps_from_path(scene_path)
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:after_asset_install (scene={scene_path}) | "
+        )
 
         # Track scene compilation time (XML processing + MuJoCo spec.compile())
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:before_scene_compile (scene={scene_path}) | "
+        )
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_compile")
         try:
@@ -774,12 +845,33 @@ class BaseMujocoTaskSampler:
             ) from e
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_compile")
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:after_scene_compile (scene={scene_path}) | "
+        )
 
         # Create new environment around new model
         if self._env is not None:
+            if _should_log_memory():
+                model_b, data_b, total_b = _estimate_env_native_bytes(self._env)
+                try:
+                    n_batch = len(self._env.mj_datas)
+                except Exception:
+                    n_batch = getattr(self._env, "n_batch", "unknown")
+                log.info(
+                    "[mem][task_sampler] closing previous env | "
+                    f"mujoco_model={_format_bytes(model_b)}, "
+                    f"mujoco_data_per_batch={_format_bytes(data_b)}, "
+                    f"n_batch={n_batch}, "
+                    f"mujoco_total_est={_format_bytes(total_b)}"
+                )
+                _log_memory_usage(prefix="[mem][task_sampler] before env.close() | ")
             self._env.close()
+            _log_memory_usage(prefix="[mem][task_sampler] after env.close() | ")
 
         # Track environment creation time
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:before_env_create (scene={scene_path}) | "
+        )
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_env_create")
         self._env = CPUMujocoEnv(
@@ -791,17 +883,30 @@ class BaseMujocoTaskSampler:
         )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:after_env_create (scene={scene_path}) | "
+        )
 
         self.used_robot_positions.clear()
 
         log.info(f"Scene updated: {scene_path}")
 
         # Track scene initialization time (randomizer setup, etc.)
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:before_scene_init (scene={scene_path}) | "
+        )
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_init")
         self.init_scene(self._env)
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_init")
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:after_scene_init (scene={scene_path}) | "
+        )
+
+        _log_memory_usage(
+            prefix=f"[mem][task_sampler] update_scene:end (scene={scene_path}) | "
+        )
 
     def init_scene(self, env: BaseMujocoEnv) -> None:
         """
@@ -1058,6 +1163,12 @@ class BaseMujocoTaskSampler:
         )
 
         if need_load:
+            _log_memory_usage(
+                prefix=(
+                    f"[mem][task_sampler] before update_scene "
+                    f"(house={self.current_house_index}, variant={variant}) | "
+                )
+            )
             # We are changing the scene. Start with a clean config containing None values
             # for which we will sample, otherwise valid values stay un-changed
             self.config.task_config = self.config.task_config_preset_exp.model_copy(deep=True)
@@ -1077,6 +1188,12 @@ class BaseMujocoTaskSampler:
             finally:
                 if self._datagen_profiler is not None:
                     self._datagen_profiler.end("scene_load")
+            _log_memory_usage(
+                prefix=(
+                    f"[mem][task_sampler] after update_scene "
+                    f"(house={self.current_house_index}, variant={variant}) | "
+                )
+            )
             # Cache this config so that we can initalize with it, in cases where we re-use this scene.
             self.config.task_config_preset_scn = self.config.task_config.model_copy(deep=True)
             self._last_loaded_house_index = self.current_house_index
@@ -1124,7 +1241,19 @@ class BaseMujocoTaskSampler:
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("task_specific_sample")
         try:
+            _log_memory_usage(
+                prefix=(
+                    f"[mem][task_sampler] before _sample_task "
+                    f"(house={self.current_house_index}) | "
+                )
+            )
             task = self._sample_task(self.env)
+            _log_memory_usage(
+                prefix=(
+                    f"[mem][task_sampler] after _sample_task "
+                    f"(house={self.current_house_index}) | "
+                )
+            )
         finally:
             if self._datagen_profiler is not None:
                 self._datagen_profiler.end("task_specific_sample")
@@ -1133,6 +1262,12 @@ class BaseMujocoTaskSampler:
         # This is needed because camera setup may happen before the final mj_forward call,
         # and env.step() (which normally updates cameras) hasn't been called yet.
         self.env.camera_manager.registry.update_all_cameras(self.env)
+        _log_memory_usage(
+            prefix=(
+                f"[mem][task_sampler] after update_all_cameras "
+                f"(house={self.current_house_index}) | "
+            )
+        )
         log.info(f"Sampled task '{task.get_task_description()}'")
 
         return task

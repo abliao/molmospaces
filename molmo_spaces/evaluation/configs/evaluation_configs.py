@@ -28,6 +28,7 @@ is strictly authoritative for episode initialization.
 from __future__ import annotations
 
 import datetime
+import os
 from pathlib import Path
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
@@ -37,6 +38,7 @@ from molmo_spaces.configs.policy_configs_baselines import (
     DreamZeroPolicyConfig,
     PiPolicyConfig,
     TeleopPolicyConfig,
+    WallXServerAdapterPolicyConfig,
 )
 from molmo_spaces.configs.robot_configs import (
     ActionNoiseConfig,
@@ -205,6 +207,76 @@ class CAPPolicyEvalConfig(JsonBenchmarkEvalConfig):
     def model_post_init(self, __context):
         super().model_post_init(__context)
         self.robot_config.action_noise_config.enabled = False
+
+
+class WallXServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
+    robot_config: FrankaRobotConfig = FrankaRobotConfig()
+    policy_config: WallXServerAdapterPolicyConfig = WallXServerAdapterPolicyConfig(
+        # DROID clean follow poses use a tool frame whose local +x points toward
+        # the TCP; MolmoSpaces sim exposes a TCP-aligned grasp site, so we need
+        # both the 15 cm translation offset and the fixed frame rotation.
+        max_open_loop_steps=5,
+        wallx_follow_pose_from_tcp_offset_local=(-0.15, 0.0, 0.0),
+        wallx_follow_rotation_from_tcp_euler_xyz_deg=(0.0, -90.0, 0.0),
+    )
+    # DROID / Wall-X data is recorded at ~15 Hz, so keep follow-pose eval at the
+    # same control rate to avoid over-stretching each predicted action chunk.
+    policy_dt_ms: float = 66.0
+
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
+        self.robot_config.action_noise_config.enabled = False
+
+
+class WallXJointServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
+    robot_config: FrankaRobotConfig = FrankaRobotConfig()
+    policy_config: WallXServerAdapterPolicyConfig = WallXServerAdapterPolicyConfig(
+        remote_config=dict(host="39.101.65.229", port=40993),
+        wallx_io_mode="joint",
+        max_open_loop_steps=16,
+        save_request_video=False,
+        front_camera_payload_key="face_view",
+        left_wrist_payload_key="left_wrist_view",
+        right_wrist_payload_key="right_wrist_view",
+        wallx_joint_state_arm_key="follow_left_arm_joint_pos",
+        wallx_joint_state_gripper_key="follow_left_gripper",
+        wallx_joint_action_arm_key="master_left_arm_joint_pos",
+        wallx_joint_action_gripper_key="master_left_gripper",
+        wallx_joint_action_mode="absolute",
+        wallx_joint_gripper_scalar_mode="normalized_open",
+    )
+    # DROID trajectories are recorded at 15 FPS (~66.7 ms per step). Use 66 ms
+    # here because policy_dt_ms must be an integer multiple of ctrl_dt_ms (2 ms).
+    policy_dt_ms: float = 66.0
+
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
+        self.robot_config.action_noise_config.enabled = False
+
+        remote_config = dict(self.policy_config.remote_config or {})
+
+        host_override = os.environ.get("WALLX_SERVER_HOST")
+        if host_override:
+            remote_config["host"] = host_override
+
+        port_override = os.environ.get("WALLX_SERVER_PORT")
+        if port_override:
+            remote_config["port"] = int(port_override)
+
+        if remote_config:
+            self.policy_config.remote_config = remote_config
+
+        max_open_loop_override = os.environ.get("WALLX_MAX_OPEN_LOOP_STEPS")
+        if max_open_loop_override:
+            self.policy_config.max_open_loop_steps = int(max_open_loop_override)
+
+        joint_action_mode_override = os.environ.get("WALLX_JOINT_ACTION_MODE")
+        if joint_action_mode_override:
+            self.policy_config.wallx_joint_action_mode = joint_action_mode_override
+
+        joint_action_arm_key_override = os.environ.get("WALLX_JOINT_ACTION_ARM_KEY")
+        if joint_action_arm_key_override:
+            self.policy_config.wallx_joint_action_arm_key = joint_action_arm_key_override
 
 
 class TeleopPolicyEvalConfig(JsonBenchmarkEvalConfig):

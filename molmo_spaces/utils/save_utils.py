@@ -625,8 +625,19 @@ def save_trajectories(
             _save_sensor_params_from_batched(obs_group, episode_data)
 
             # Save sensor data (camera structure)
+            # Prefer per-episode video naming metadata if recorded (used when
+            # batches from multiple workers are later consolidated into one h5).
+            video_episode_idx = episode_data.get("_video_episode_idx", episode_idx)
+            video_save_file_suffix = episode_data.get(
+                "_video_save_file_suffix", save_file_suffix
+            )
             _save_sensor_data_from_batched(
-                obs_group, episode_data, episode_idx, save_dir, save_file_suffix, logger
+                obs_group,
+                episode_data,
+                video_episode_idx,
+                save_dir,
+                video_save_file_suffix,
+                logger,
             )
 
             # Save actions

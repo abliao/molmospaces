@@ -2,8 +2,10 @@ import gc
 import logging
 import multiprocessing as mp
 import os
+import pickle
 import pprint
 import random
+import shutil
 import signal
 import threading
 import time
@@ -54,6 +56,22 @@ def log_memory_usage(logger, prefix="") -> None:
     logger.info(f"{prefix}Memory usage: {mem_usage:.2f} MB")
 
 
+def should_log_memory(exp_config: "MlSpacesExpConfig") -> bool:
+    """
+    Lightweight switch for memory logging.
+
+    Enabled when:
+    - env var MOLMO_LOG_MEMORY is set (e.g. "1"), OR
+    - exp_config.log_level is "debug"
+    """
+    try:
+        if os.environ.get("MOLMO_LOG_MEMORY", ""):
+            return True
+    except Exception:
+        pass
+    return getattr(exp_config, "log_level", "").lower() == "debug"
+
+
 def get_detailed_memory_info():
     """Get detailed memory usage information"""
     process = psutil.Process()
@@ -70,6 +88,15 @@ def get_detailed_memory_info():
 # These are used by both ParallelRolloutRunner and JsonEvalRunner to reduce
 # code duplication in process_single_house implementations.
 # =============================================================================
+
+
+# Suffix of the consolidated trajectories file written by finalize_house_trajectories.
+# All batches for the same house are merged into this single file. We keep the
+# legacy "_batch_1_of_1" convention so downstream consumers / benchmarks /
+# tests continue to find `trajectories_batch_1_of_1.h5` per house, regardless
+# of how many internal batches a house was split into during evaluation.
+CONSOLIDATED_TRAJECTORIES_SUFFIX = "_batch_1_of_1"
+PARTIAL_DIR_NAME = "_partial"
 
 
 def setup_house_dirs(
@@ -89,18 +116,29 @@ def setup_house_dirs(
 
     Returns:
         tuple: (house_output_dir, house_debug_dir, batch_suffix, should_skip)
+
+    Notes:
+        - batch_suffix is the filename suffix used by the final consolidated
+          trajectories file (same for every batch of a given house so they all
+          refer to the same output file).
+        - should_skip is True when EITHER the final consolidated file already
+          exists (whole house done) OR the per-batch partial pkl already exists
+          (this specific batch was already recorded by a previous run).
     """
     house_output_dir = exp_config.output_dir / f"house_{house_id}"
     debug_base_dir = exp_config.output_dir.parent / "debug" / exp_config.output_dir.name
     house_debug_dir = debug_base_dir / f"house_{house_id}"
 
-    if batch_num is None or total_batches is None:
-        batch_num = 1
-        total_batches = 1
-    batch_suffix = f"_batch_{batch_num}_of_{total_batches}"
+    # Always use a consolidated suffix; every batch for the same house writes to
+    # the same final file via record+finalize.
+    batch_suffix = CONSOLIDATED_TRAJECTORIES_SUFFIX
 
-    batch_file = house_output_dir / f"trajectories{batch_suffix}.h5"
-    should_skip = batch_file.exists()
+    final_file = house_output_dir / f"trajectories{batch_suffix}.h5"
+    partial_pkl = None
+    if batch_num is not None:
+        partial_pkl = house_output_dir / PARTIAL_DIR_NAME / f"batch_{batch_num:04d}.pkl"
+
+    should_skip = final_file.exists() or (partial_pkl is not None and partial_pkl.exists())
 
     return house_output_dir, house_debug_dir, batch_suffix, should_skip
 
@@ -231,7 +269,12 @@ def save_house_trajectories(
             )
             if prepared_episode is not None:
                 house_trajectory_data.append(prepared_episode)
-            del episode_info["history"]
+            # Break references eagerly: histories can be huge; sensor_suite can retain renderers/GPU buffers
+            # through sensor instances (depends on configured sensors).
+            if "history" in episode_info:
+                del episode_info["history"]
+            if "sensor_suite" in episode_info:
+                del episode_info["sensor_suite"]
 
         t_batch = time.perf_counter() - t_start
         if datagen_profiler is not None:
@@ -265,6 +308,236 @@ def save_house_trajectories(
     except Exception as e:
         worker_logger.error(f"Failed to save trajectory data for {house_output_dir.name}: {e}")
         traceback.print_exc()
+
+
+def record_house_trajectories(
+    worker_logger,
+    house_raw_histories: list,
+    house_output_dir: Path,
+    exp_config: "MlSpacesExpConfig",
+    batch_num: int,
+    episode_start_idx: int,
+    datagen_profiler: "DatagenProfiler | None" = None,
+) -> None:
+    """
+    Global recorder: prepare episodes (videos + batched tensors) and pickle the
+    tensor portion to house_output_dir/_partial/batch_{batch_num:04d}.pkl.
+
+    Videos are saved immediately to house_output_dir during preparation and are
+    NOT re-written by finalize_house_trajectories. This function does NOT call
+    save_trajectories(); finalization is deferred to the last worker for this
+    house (see finalize_house_trajectories).
+
+    Args:
+        worker_logger: Logger for this worker
+        house_raw_histories: List of episode info dicts with 'history' and 'sensor_suite'
+        house_output_dir: Per-house output directory
+        exp_config: Experiment configuration
+        batch_num: 1-indexed batch number for this house
+        episode_start_idx: Global episode index offset for this batch within the house
+            (used so mp4 filenames don't collide across batches)
+        datagen_profiler: Optional DatagenProfiler
+    """
+    if not house_raw_histories:
+        worker_logger.info(
+            f"No trajectory data to record for {house_output_dir.name} batch {batch_num}"
+        )
+        return
+
+    os.makedirs(house_output_dir, exist_ok=True)
+    partial_dir = house_output_dir / PARTIAL_DIR_NAME
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    pkl_path = partial_dir / f"batch_{batch_num:04d}.pkl"
+
+    worker_logger.info(
+        f"Recording {len(house_raw_histories)} episodes for {house_output_dir.name} "
+        f"batch {batch_num} -> {pkl_path.name}"
+    )
+
+    t_start = time.perf_counter()
+    if datagen_profiler is not None:
+        datagen_profiler.start("record_batch_prep")
+
+    prepared_episodes: list[dict] = []
+    # Save suffix used for mp4 filenames (kept empty so every consolidated h5
+    # references videos via `episode_{idx:08d}_{cam}.mp4`).
+    video_save_file_suffix = ""
+    for idx, episode_info in enumerate(house_raw_histories):
+        # Use globally unique (per-house) episode_idx so mp4 filenames don't collide
+        global_episode_idx = episode_start_idx + idx
+        prepared_episode = prepare_episode_for_saving(
+            episode_info["history"],
+            episode_info["sensor_suite"],
+            fps=exp_config.fps,
+            save_dir=house_output_dir,
+            episode_idx=global_episode_idx,
+            # Use empty suffix so mp4 filenames and h5 internal references match
+            # (finalize writes h5 with CONSOLIDATED_TRAJECTORIES_SUFFIX; video paths
+            # are preserved via the per-episode metadata stashed below).
+            save_file_suffix=video_save_file_suffix,
+        )
+        if prepared_episode is not None:
+            # Stash the actual mp4 naming metadata so save_trajectories uses the
+            # same (global_episode_idx, empty suffix) when writing h5 references,
+            # regardless of the enum index within the concatenated list.
+            prepared_episode["_video_episode_idx"] = global_episode_idx
+            prepared_episode["_video_save_file_suffix"] = video_save_file_suffix
+            prepared_episodes.append(prepared_episode)
+        # Drop big references eagerly
+        if "history" in episode_info:
+            del episode_info["history"]
+        if "sensor_suite" in episode_info:
+            del episode_info["sensor_suite"]
+
+    if datagen_profiler is not None:
+        datagen_profiler.end("record_batch_prep")
+    t_prep = time.perf_counter() - t_start
+
+    t_dump_start = time.perf_counter()
+    try:
+        with open(pkl_path, "wb") as f:
+            pickle.dump(prepared_episodes, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        worker_logger.error(
+            f"Failed to pickle partial trajectories for {house_output_dir.name} "
+            f"batch {batch_num}: {e}"
+        )
+        traceback.print_exc()
+        # Best-effort cleanup of a partially written file
+        try:
+            if pkl_path.exists():
+                pkl_path.unlink()
+        except Exception:
+            pass
+        return
+    t_dump = time.perf_counter() - t_dump_start
+
+    worker_logger.info(
+        f"Recorded {len(prepared_episodes)} prepared episodes for {house_output_dir.name} "
+        f"batch {batch_num} (prep={t_prep:.2f}s, dump={t_dump:.2f}s)"
+    )
+
+    del prepared_episodes
+    gc.collect()
+
+
+def finalize_house_trajectories(
+    worker_logger,
+    house_output_dir: Path,
+    exp_config: "MlSpacesExpConfig",
+    datagen_profiler: "DatagenProfiler | None" = None,
+) -> None:
+    """
+    Global finalizer: called by the LAST worker for a house.
+
+    Loads all batch_*.pkl partials from house_output_dir/_partial/, concatenates
+    the prepared episodes, writes a single consolidated
+    `trajectories{CONSOLIDATED_TRAJECTORIES_SUFFIX}.h5`, and then deletes the
+    _partial/ directory.
+
+    Videos were already saved by record_house_trajectories during preparation,
+    so save_trajectories is called with save_mp4s=True but the internal camera
+    frames have been stripped and only video path references are written.
+    """
+    partial_dir = house_output_dir / PARTIAL_DIR_NAME
+    if not partial_dir.exists():
+        worker_logger.warning(f"No partial dir to finalize at {partial_dir}")
+        return
+
+    partial_paths = sorted(partial_dir.glob("batch_*.pkl"))
+    if not partial_paths:
+        worker_logger.warning(
+            f"No partial batch pkls found in {partial_dir}; skipping finalize and cleaning up"
+        )
+        shutil.rmtree(partial_dir, ignore_errors=True)
+        return
+
+    worker_logger.info(
+        f"Finalizing {house_output_dir.name}: merging {len(partial_paths)} partial batch files"
+    )
+
+    t_load_start = time.perf_counter()
+    all_prepared: list[dict] = []
+    for p in partial_paths:
+        try:
+            with open(p, "rb") as f:
+                batch_data = pickle.load(f)
+            if batch_data:
+                all_prepared.extend(batch_data)
+        except Exception as e:
+            worker_logger.error(f"Failed to load partial {p}: {e}")
+            traceback.print_exc()
+    t_load = time.perf_counter() - t_load_start
+
+    if not all_prepared:
+        worker_logger.warning(
+            f"No episodes to save for {house_output_dir.name} after loading partials; "
+            f"cleaning up {partial_dir}"
+        )
+        shutil.rmtree(partial_dir, ignore_errors=True)
+        return
+
+    worker_logger.info(
+        f"Loaded {len(all_prepared)} prepared episodes from {len(partial_paths)} partials "
+        f"in {t_load:.2f}s; writing consolidated h5..."
+    )
+
+    try:
+        t_save_start = time.perf_counter()
+        if datagen_profiler is not None:
+            datagen_profiler.start("save_trajectories")
+        save_trajectories(
+            all_prepared,
+            save_dir=house_output_dir,
+            fps=exp_config.fps,
+            save_file_suffix=CONSOLIDATED_TRAJECTORIES_SUFFIX,
+            save_mp4s=True,
+            logger=worker_logger,
+        )
+        if datagen_profiler is not None:
+            datagen_profiler.end("save_trajectories")
+        worker_logger.info(
+            f"Finalized {house_output_dir.name} in {time.perf_counter() - t_save_start:.2f}s"
+        )
+    except Exception as e:
+        worker_logger.error(f"Failed to save consolidated trajectories for {house_output_dir.name}: {e}")
+        traceback.print_exc()
+        # Do NOT delete partials if final save failed, so we can retry on next run.
+        return
+    finally:
+        del all_prepared
+        gc.collect()
+
+    # Delete the recorded global trajectories (partial pkls) after successful save.
+    try:
+        shutil.rmtree(partial_dir, ignore_errors=True)
+        worker_logger.info(f"Deleted partials at {partial_dir}")
+    except Exception as e:
+        worker_logger.warning(f"Failed to delete partial dir {partial_dir}: {e}")
+
+
+def mark_house_batch_done_and_check_last(
+    house_done_counts,
+    house_save_lock,
+    house_id: int,
+    total_batches: int,
+) -> bool:
+    """
+    Atomically increment the done count for a house and report whether we are
+    the last worker to finish a batch for that house.
+
+    Returns True iff after this increment the done count has reached
+    total_batches (i.e. this worker is responsible for finalization).
+    """
+    if house_done_counts is None or house_save_lock is None:
+        # No shared coordination available: treat as last-batch when batch is 1/1
+        return total_batches <= 1
+
+    with house_save_lock:
+        prev = house_done_counts.get(house_id, 0)
+        new_count = prev + 1
+        house_done_counts[house_id] = new_count
+        return new_count >= total_batches
 
 
 def cleanup_episode_resources(
@@ -335,7 +608,7 @@ def cleanup_context():
 def house_processing_worker(
     worker_id: int,
     exp_config: MlSpacesExpConfig,
-    house_indices: list[int],
+    work_items: list[dict],
     samples_per_house: int,
     shutdown_event,
     counter_lock,
@@ -350,6 +623,9 @@ def house_processing_worker(
     preloaded_policy: BasePolicy | None = None,
     filter_for_successful_trajectories: bool = False,
     runner_class=None,
+    max_houses_per_worker: int | None = None,
+    house_done_counts=None,
+    house_save_lock=None,
 ):
     """
     Standalone worker function that processes houses sequentially from a shared counter.
@@ -378,6 +654,7 @@ def house_processing_worker(
     """
     # Create worker-specific logger
     worker_logger = get_worker_logger(worker_id)
+    log_mem = should_log_memory(exp_config)
 
     # Create per-worker profiler for timing analysis
     if hasattr(exp_config, "datagen_profiler") and exp_config.datagen_profiler:
@@ -387,6 +664,7 @@ def house_processing_worker(
 
     # Track sequential irrecoverable failures at worker level
     num_sequential_irrecoverable_failures = 0
+    houses_processed_by_worker = 0
 
     # Normal datagen: create task sampler once for this worker (persists across all houses)
     # This allows the worker to track object diversity and other state across houses
@@ -397,6 +675,8 @@ def house_processing_worker(
     # Use context manager for worker-specific stdout redirection
     with worker_stdout_context(worker_logger, worker_id):
         try:
+            if log_mem:
+                log_memory_usage(worker_logger, prefix=f"[mem][worker={worker_id}] start | ")
             while True:
                 # Check for shutdown signal
                 if shutdown_event.is_set():
@@ -405,19 +685,38 @@ def house_processing_worker(
                     )
                     break
 
-                # Get next house to process atomically
+                # Get next work item to process atomically
                 with counter_lock:
-                    if house_counter.value >= len(house_indices):
-                        break  # No more houses to process
-                    house_idx = house_counter.value
-                    current_house_id = house_indices[house_idx]
+                    if house_counter.value >= len(work_items):
+                        break  # No more work items to process
+                    item_idx = house_counter.value
+                    work_item = work_items[item_idx]
+                    current_house_id = int(work_item["house_id"])
+                    batch_num = work_item.get("batch_num")
+                    total_batches = work_item.get("total_batches")
+                    episode_start_idx = work_item.get("episode_start_idx")
+                    episode_end_idx = work_item.get("episode_end_idx")
                     house_counter.value += 1
 
-                worker_logger.info(
-                    f"Worker {worker_id} starting house {current_house_id} (index {house_idx}/{len(house_indices)})"
+                batch_info = (
+                    f" batch {batch_num}/{total_batches}"
+                    if batch_num is not None and total_batches is not None
+                    else ""
                 )
+                worker_logger.info(
+                    f"Worker {worker_id} starting house {current_house_id}{batch_info} "
+                    f"(work_item {item_idx}/{len(work_items)})"
+                )
+                if log_mem:
+                    log_memory_usage(
+                        worker_logger,
+                        prefix=(
+                            f"[mem][worker={worker_id}][house={current_house_id}] "
+                            "before process_single_house | "
+                        ),
+                    )
 
-                # Process this house
+                # Process this house (or this batch of the house)
                 house_success_count, house_total_count, irrecoverable = (
                     runner_class.process_single_house(
                         worker_id,
@@ -432,9 +731,23 @@ def house_processing_worker(
                         max_allowed_sequential_rollout_failures,
                         filter_for_successful_trajectories=filter_for_successful_trajectories,
                         runner_class=runner_class,
+                        batch_num=batch_num,
+                        total_batches=total_batches,
+                        episode_start_idx=episode_start_idx,
+                        episode_end_idx=episode_end_idx,
+                        house_done_counts=house_done_counts,
+                        house_save_lock=house_save_lock,
                         datagen_profiler=datagen_profiler,
                     )
                 )
+                if log_mem:
+                    log_memory_usage(
+                        worker_logger,
+                        prefix=(
+                            f"[mem][worker={worker_id}][house={current_house_id}] "
+                            f"after process_single_house (succ={house_success_count}, total={house_total_count}) | "
+                        ),
+                    )
 
                 # Update global counters
                 with counter_lock:
@@ -444,6 +757,18 @@ def house_processing_worker(
                         completed_houses.value += 1
                     else:
                         skipped_houses.value += 1
+
+                houses_processed_by_worker += 1
+                if (
+                    max_houses_per_worker is not None
+                    and max_houses_per_worker > 0
+                    and houses_processed_by_worker >= max_houses_per_worker
+                ):
+                    worker_logger.info(
+                        f"Worker {worker_id} reached max_houses_per_worker={max_houses_per_worker}. "
+                        "Exiting to allow process-level memory reclamation."
+                    )
+                    break
 
                 # Track sequential irrecoverable failures
                 if irrecoverable:
@@ -528,6 +853,20 @@ class ParallelRolloutRunner:
 
         self.total_houses = len(self.house_indices)
 
+        # Build work items: each item is one (house_id, optional episode slice/batch).
+        # Subclasses can override build_work_items to split a house across multiple workers.
+        self.work_items: list[dict] = type(self).build_work_items(
+            exp_config=exp_config,
+            house_indices=self.house_indices,
+            samples_per_house=self.samples_per_house,
+        )
+
+        # Shared coordination state so the last worker for a house runs finalize.
+        # We use a Manager so the dict/lock survive across worker processes.
+        self._mp_manager = mp_context.Manager()
+        self.house_done_counts = self._mp_manager.dict()
+        self.house_save_lock = self._mp_manager.Lock()
+
         # Failure tracking limits
         self.max_allowed_sequential_task_sampler_failures = (
             exp_config.task_sampler_config.max_allowed_sequential_task_sampler_failures
@@ -596,6 +935,35 @@ class ParallelRolloutRunner:
     # Override these in subclasses to customize episode iteration behavior.
     # All hooks are static methods called via runner_class in process_single_house.
     # =========================================================================
+
+    @staticmethod
+    def build_work_items(
+        exp_config: "MlSpacesExpConfig",
+        house_indices: list[int],
+        samples_per_house: int,
+    ) -> list[dict]:
+        """
+        Build the list of work items (units dispatched to workers).
+
+        Default: one item per house (no intra-house batching). Subclasses can
+        override this to split a house's episodes across multiple workers so
+        that different workers cooperate on the same house. Each item has:
+            - house_id: int
+            - batch_num: int | None (1-indexed)
+            - total_batches: int | None
+            - episode_start_idx: int | None (inclusive, None => from beginning)
+            - episode_end_idx: int | None (exclusive, None => to end)
+        """
+        return [
+            {
+                "house_id": int(h),
+                "batch_num": 1,
+                "total_batches": 1,
+                "episode_start_idx": None,
+                "episode_end_idx": None,
+            }
+            for h in house_indices
+        ]
 
     @staticmethod
     def load_episodes_for_house(
@@ -797,6 +1165,10 @@ class ParallelRolloutRunner:
         runner_class=None,
         batch_num: int | None = None,
         total_batches: int | None = None,
+        episode_start_idx: int | None = None,
+        episode_end_idx: int | None = None,
+        house_done_counts=None,
+        house_save_lock=None,
         datagen_profiler: DatagenProfiler | None = None,
     ) -> tuple[int, int, bool]:
         """
@@ -839,16 +1211,47 @@ class ParallelRolloutRunner:
         house_success_count = 0
         house_total_count = 0
         irrecoverable_failure_in_house = False
+        log_mem = should_log_memory(exp_config)
 
         # Setup directories and check for existing output
         house_output_dir, house_debug_dir, batch_suffix, should_skip = setup_house_dirs(
             exp_config, house_id, batch_num, total_batches
         )
+        final_h5 = house_output_dir / f"trajectories{batch_suffix}.h5"
         if should_skip:
+            if final_h5.exists():
+                worker_logger.info(
+                    f"SKIPPING HOUSE {house_id} BATCH {batch_num}/{total_batches}: "
+                    f"Consolidated output already exists at {final_h5}"
+                )
+                # Whole house already saved elsewhere; do NOT touch the done
+                # counter because other batches for this house will take the
+                # same branch and finalize has already happened.
+                return 0, 0, False
+            # Per-batch partial exists: count this batch as done and, if we are
+            # the last, run finalize to produce the consolidated file.
+            partial_pkl = (
+                house_output_dir / PARTIAL_DIR_NAME / f"batch_{batch_num:04d}.pkl"
+                if batch_num is not None
+                else None
+            )
             worker_logger.info(
                 f"SKIPPING HOUSE {house_id} BATCH {batch_num}/{total_batches}: "
-                f"Output already exists at {house_output_dir / f'trajectories{batch_suffix}.h5'}"
+                f"Partial already recorded at {partial_pkl}"
             )
+            is_last = mark_house_batch_done_and_check_last(
+                house_done_counts,
+                house_save_lock,
+                house_id,
+                total_batches if total_batches is not None else 1,
+            )
+            if is_last:
+                finalize_house_trajectories(
+                    worker_logger,
+                    house_output_dir,
+                    exp_config,
+                    datagen_profiler=datagen_profiler,
+                )
             return 0, 0, False
 
         # Load episodes using hook - allows subclasses to load from different scene datasets
@@ -858,15 +1261,61 @@ class ParallelRolloutRunner:
 
         if not episode_specs:
             worker_logger.warning(f"No episodes to process for house {house_id}")
+            # Still count this batch as "done" so finalize can trigger.
+            is_last = mark_house_batch_done_and_check_last(
+                house_done_counts,
+                house_save_lock,
+                house_id,
+                total_batches if total_batches is not None else 1,
+            )
+            if is_last:
+                finalize_house_trajectories(
+                    worker_logger,
+                    house_output_dir,
+                    exp_config,
+                    datagen_profiler=datagen_profiler,
+                )
             return 0, 0, False
+
+        # Optional slicing for batched processing: only process a subset of episode specs.
+        if episode_start_idx is not None or episode_end_idx is not None:
+            s = int(episode_start_idx or 0)
+            e = int(episode_end_idx) if episode_end_idx is not None else None
+            episode_specs = episode_specs[s:e]
+            if not episode_specs:
+                worker_logger.warning(
+                    f"No episodes left after slicing for house {house_id}: "
+                    f"start={episode_start_idx}, end={episode_end_idx}"
+                )
+                is_last = mark_house_batch_done_and_check_last(
+                    house_done_counts,
+                    house_save_lock,
+                    house_id,
+                    total_batches if total_batches is not None else 1,
+                )
+                if is_last:
+                    finalize_house_trajectories(
+                        worker_logger,
+                        house_output_dir,
+                        exp_config,
+                        datagen_profiler=datagen_profiler,
+                    )
+                return 0, 0, False
 
         max_attempts = runner_class.get_max_episode_attempts(
             episode_specs, samples_per_house, exp_config
         )
-
         # Collect raw history data for this house
         house_raw_histories = []
         house_debug_raw_histories = []
+        if log_mem:
+            log_memory_usage(
+                worker_logger,
+                prefix=(
+                    f"[mem][worker={worker_id}][house={house_id}] "
+                    f"after load_episodes (n_specs={len(episode_specs)}) | "
+                ),
+            )
 
         # Sequential failure tracking
         num_sequential_task_sampler_failures = 0
@@ -876,6 +1325,14 @@ class ParallelRolloutRunner:
         # While loop with explicit index - allows subclasses to customize iteration
         episode_idx = 0
         while episode_idx < max_attempts:
+            if log_mem:
+                log_memory_usage(
+                    worker_logger,
+                    prefix=(
+                        f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                        f"episode_start (collected={len(house_raw_histories)}/{samples_per_house}) | "
+                    ),
+                )
             # Check early stop condition (e.g., enough successes for datagen)
             should_stop = runner_class.should_stop_early(
                 len(house_raw_histories), samples_per_house, exp_config=exp_config
@@ -942,9 +1399,25 @@ class ParallelRolloutRunner:
                     )
 
                     # Sample task
+                    if log_mem:
+                        log_memory_usage(
+                            worker_logger,
+                            prefix=(
+                                f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                f"before_sample_task_from_spec | "
+                            ),
+                        )
                     task = runner_class.sample_task_from_spec(
                         episode_task_sampler, house_id, episode_spec, episode_idx
                     )
+                    if log_mem:
+                        log_memory_usage(
+                            worker_logger,
+                            prefix=(
+                                f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                f"after_sample_task_from_spec | "
+                            ),
+                        )
 
                     if task is None:
                         worker_logger.info(
@@ -996,10 +1469,35 @@ class ParallelRolloutRunner:
                 if task is not None and not house_invalid and not task_sampling_failed:
                     try:
                         # Setup policy and viewer
+                        if log_mem:
+                            log_memory_usage(
+                                worker_logger,
+                                prefix=(
+                                    f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                    f"before_setup_policy | "
+                                ),
+                            )
                         policy = setup_policy(
                             episode_config, task, preloaded_policy, datagen_profiler
                         )
+
+                        if log_mem:
+                            log_memory_usage(
+                                worker_logger,
+                                prefix=(
+                                    f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                    f"after_setup_policy | "
+                                ),
+                            )
                         viewer = setup_viewer(episode_config, task, policy, viewer)
+                        if log_mem:
+                            log_memory_usage(
+                                worker_logger,
+                                prefix=(
+                                    f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                    f"after_setup_viewer | "
+                                ),
+                            )
 
                         # Get episode seed
                         episode_seed = runner_class.get_episode_seed(
@@ -1007,6 +1505,14 @@ class ParallelRolloutRunner:
                         )
 
                         # Run the rollout
+                        if log_mem:
+                            log_memory_usage(
+                                worker_logger,
+                                prefix=(
+                                    f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                    f"before_run_single_rollout | "
+                                ),
+                            )
                         success = runner_class.run_single_rollout(
                             episode_seed=episode_seed,
                             task=task,
@@ -1017,7 +1523,14 @@ class ParallelRolloutRunner:
                             datagen_profiler=datagen_profiler,
                             end_on_success=exp_config.end_on_success,
                         )
-
+                        if log_mem:
+                            log_memory_usage(
+                                worker_logger,
+                                prefix=(
+                                    f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                    f"after_run_single_rollout | "
+                                ),
+                            )
                         num_sequential_rollout_failures = 0
 
                         # Extract object name for logging if available
@@ -1049,6 +1562,15 @@ class ParallelRolloutRunner:
                                 house_debug_raw_histories.append(episode_info)
                                 worker_logger.info(
                                     f"Queueing failed trajectory for debug (seed: {episode_seed})"
+                                )
+                            if log_mem:
+                                log_memory_usage(
+                                    worker_logger,
+                                    prefix=(
+                                        f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                                        f"after_append (save={should_save}, debug={should_save_debug}, "
+                                        f"kept={len(house_raw_histories)}, dbg={len(house_debug_raw_histories)}) | "
+                                    ),
                                 )
                         else:
                             del history
@@ -1110,6 +1632,15 @@ class ParallelRolloutRunner:
                     preloaded_policy=preloaded_policy,
                     close_task_sampler=runner_class.should_close_episode_task_sampler(),
                 )
+                del task, episode_task_sampler
+                if log_mem:
+                    log_memory_usage(
+                        worker_logger,
+                        prefix=(
+                            f"[mem][worker={worker_id}][house={house_id}][ep={episode_idx}] "
+                            "after_cleanup_episode_resources | "
+                        ),
+                    )
 
             # Handle house invalid - break after cleanup
             if house_invalid:
@@ -1131,29 +1662,76 @@ class ParallelRolloutRunner:
             )
             return house_success_count, house_total_count, True
 
-        # Save trajectories
-        save_house_trajectories(
+        # Record this batch's trajectories into house_output_dir/_partial/batch_*.pkl.
+        # The actual consolidated h5 save is deferred to the last worker for this house.
+        if log_mem:
+            log_memory_usage(
+                worker_logger,
+                prefix=(
+                    f"[mem][worker={worker_id}][house={house_id}] "
+                    f"before_record (kept={len(house_raw_histories)}, dbg={len(house_debug_raw_histories)}) | "
+                ),
+            )
+        record_batch_num = batch_num if batch_num is not None else 1
+        record_start_idx = int(episode_start_idx) if episode_start_idx is not None else 0
+        record_house_trajectories(
             worker_logger,
             house_raw_histories,
             house_output_dir,
             exp_config,
-            batch_suffix,
-            datagen_profiler,
-            batch_num,
-            total_batches,
+            batch_num=record_batch_num,
+            episode_start_idx=record_start_idx,
+            datagen_profiler=datagen_profiler,
         )
 
-        # Save debug trajectories
+        # Atomically mark this batch as done; the last worker finalizes.
+        effective_total_batches = total_batches if total_batches is not None else 1
+        is_last = mark_house_batch_done_and_check_last(
+            house_done_counts,
+            house_save_lock,
+            house_id,
+            effective_total_batches,
+        )
+        if is_last:
+            worker_logger.info(
+                f"Worker {worker_id} is the LAST worker for house {house_id} "
+                f"(total_batches={effective_total_batches}); running finalize."
+            )
+            finalize_house_trajectories(
+                worker_logger,
+                house_output_dir,
+                exp_config,
+                datagen_profiler=datagen_profiler,
+            )
+
+        # Save debug trajectories (legacy path, per-batch file to avoid cross-batch
+        # overwrite within the same house; debug data is rare and small anyway).
+        debug_suffix = (
+            f"_batch_{batch_num}_of_{total_batches}"
+            if (batch_num is not None and total_batches is not None)
+            else batch_suffix
+        )
         save_house_trajectories(
             worker_logger,
             house_debug_raw_histories,
             house_debug_dir,
             exp_config,
-            batch_suffix,
+            debug_suffix,
             datagen_profiler=None,
             batch_num=batch_num,
             total_batches=total_batches,
         )
+        # Ensure we drop all remaining references for this house
+        house_raw_histories.clear()
+        house_debug_raw_histories.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if log_mem:
+            log_memory_usage(
+                worker_logger,
+                prefix=f"[mem][worker={worker_id}][house={house_id}] after_save | ",
+            )
 
         worker_logger.info(
             f"Worker {worker_id} completed house {house_id}: "
@@ -1191,11 +1769,25 @@ class ParallelRolloutRunner:
             tuple: (success_count, total_count)
         """
         total_expected_episodes = self.total_houses * self.samples_per_house
+        total_work_items = len(self.work_items)
         self.logger.info(
             f"Starting house-by-house rollout of {self.total_houses} houses "
-            f"with {self.samples_per_house} episodes each ({total_expected_episodes} total episodes) "
+            f"with {self.samples_per_house} episodes each ({total_expected_episodes} total episodes), "
+            f"dispatched as {total_work_items} work items, "
             f"using {self.config.num_workers} worker processes"
         )
+
+        # Seed per-house total_batches expectation. build_work_items defines how
+        # many batches we expect per house; the last one to finish will finalize.
+        house_total_batches: dict[int, int] = {}
+        for wi in self.work_items:
+            h = int(wi["house_id"])
+            tb = wi.get("total_batches") or 1
+            house_total_batches[h] = max(house_total_batches.get(h, 0), int(tb))
+        # Reset done counters so a fresh run finalizes correctly.
+        with self.house_save_lock:
+            for h in house_total_batches:
+                self.house_done_counts[h] = 0
 
         # make a copy of the config in the output directory
         self.logger.info("Evaluation configuration:")
@@ -1207,14 +1799,29 @@ class ParallelRolloutRunner:
 
         # Launch worker processes
         if self.config.num_workers > 1:
-            processes = []
-            for worker_id in range(self.config.num_workers):
+            # B2: Optional process recycling to reclaim native memory (MuJoCo model compilation, renderer, etc.)
+            # Set MLSPACES_MAX_HOUSES_PER_WORKER=N to have each worker exit after N houses.
+            max_houses_per_worker_env = os.environ.get("MLSPACES_MAX_HOUSES_PER_WORKER", "").strip()
+            max_houses_per_worker: int | None = None
+            if max_houses_per_worker_env:
+                try:
+                    max_houses_per_worker = int(max_houses_per_worker_env)
+                except ValueError:
+                    self.logger.warning(
+                        f"Invalid MLSPACES_MAX_HOUSES_PER_WORKER='{max_houses_per_worker_env}', ignoring."
+                    )
+                    max_houses_per_worker = None
+
+            processes: list[mp_context.Process] = []
+            next_worker_id = 0
+
+            def spawn_worker(worker_id: int) -> mp_context.Process:
                 p = mp_context.Process(
                     target=house_processing_worker,
                     args=(
                         worker_id,
                         self.config,
-                        self.house_indices,
+                        self.work_items,
                         self.samples_per_house,
                         self.shutdown_event,
                         self.counter_lock,
@@ -1229,16 +1836,53 @@ class ParallelRolloutRunner:
                         preloaded_policy,
                         self.config.filter_for_successful_trajectories,
                         type(self),  # Pass the runner class to enable customization via subclassing
+                        max_houses_per_worker,
+                        self.house_done_counts,
+                        self.house_save_lock,
                     ),
                 )
                 p.start()
-                processes.append(p)
+                return p
+
+            # Start initial workers
+            for _ in range(self.config.num_workers):
+                processes.append(spawn_worker(next_worker_id))
+                next_worker_id += 1
 
             # Periodic logging loop that monitors progress while workers run
             last_log_time = start_time
             log_interval = 60  # Log every 60 seconds
 
-            while any(p.is_alive() for p in processes):
+            while True:
+                # Reap finished processes
+                alive_processes: list[mp_context.Process] = []
+                for p in processes:
+                    if p.is_alive():
+                        alive_processes.append(p)
+                    else:
+                        p.join()
+                        p.close()
+                processes = alive_processes
+
+                # Stop if shutdown requested
+                if self.shutdown_event.is_set():
+                    break
+
+                # Determine if any work remains
+                with self.counter_lock:
+                    houses_remaining = self.house_counter.value < len(self.work_items)
+
+                # Spawn replacement workers if enabled and work remains
+                while houses_remaining and len(processes) < self.config.num_workers:
+                    processes.append(spawn_worker(next_worker_id))
+                    next_worker_id += 1
+                    with self.counter_lock:
+                        houses_remaining = self.house_counter.value < len(self.work_items)
+
+                # Exit when no workers alive and no work remains
+                if (not processes) and (not houses_remaining):
+                    break
+
                 # Check if it's time to log
                 current_time = time.time()
                 if self.wandb_enabled and (current_time - last_log_time) >= log_interval:
@@ -1249,7 +1893,7 @@ class ParallelRolloutRunner:
                         skipped = self.skipped_houses.value
                         success = self.success_count.value
                         total = self.total_count.value
-                        active = sum(1 for p in processes if p.is_alive())
+                        active = len(processes)
 
                         # Calculate metrics
                         success_rate = success / total if total > 0 else 0.0
@@ -1284,7 +1928,7 @@ class ParallelRolloutRunner:
 
                 time.sleep(5)
 
-            # Wait for all processes to complete
+            # Ensure all processes are terminated/joined
             for p in processes:
                 p.join()
                 p.close()
@@ -1294,7 +1938,7 @@ class ParallelRolloutRunner:
             house_processing_worker(
                 worker_id=0,
                 exp_config=self.config,
-                house_indices=self.house_indices,
+                work_items=self.work_items,
                 samples_per_house=self.samples_per_house,
                 shutdown_event=self.shutdown_event,
                 counter_lock=self.counter_lock,
@@ -1311,6 +1955,9 @@ class ParallelRolloutRunner:
                 runner_class=type(
                     self
                 ),  # Pass the runner class to enable customization via subclassing
+                max_houses_per_worker=None,
+                house_done_counts=self.house_done_counts,
+                house_save_lock=self.house_save_lock,
             )
 
         # Extract final values from shared multiprocessing state
