@@ -336,7 +336,13 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
             connection_timeout=getattr(policy_config, "connection_timeout", None),
         )
 
-        self.task_type = task_type
+        # NOTE: pipeline.setup_policy calls policy_cls(exp_config, task) where
+        # the second positional arg is a BaseMujocoTask instance (e.g.
+        # OpeningTask), not the task-type string. Follow the same pattern as
+        # PI_Policy and read the task-type string from the exp_config so that
+        # it stays JSON-serializable when get_info() propagates it into
+        # obs_scene.
+        self.task_type = task_type if isinstance(task_type, str) else exp_config.task_type
         self.remote_config = remote_config
         self.infer_mode = getattr(policy_config, "infer_mode", "flow")
         self.return_action_format = getattr(policy_config, "return_action_format", "native")
@@ -1041,7 +1047,6 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
                 self.close()
                 self._prepared = False
                 response = self._request_remote_actions(model_input)
-
             predict_action = response.get("predict_action")
             if predict_action is None:
                 raise ValueError(f"Wall-X server returned no predict_action payload: {response.keys()}")

@@ -231,7 +231,7 @@ class WallXServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
 class WallXJointServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
     robot_config: FrankaRobotConfig = FrankaRobotConfig()
     policy_config: WallXServerAdapterPolicyConfig = WallXServerAdapterPolicyConfig(
-        remote_config=dict(host="39.101.65.229", port=40993),
+        remote_config=dict(host="39.101.65.229", port=32178),
         wallx_io_mode="joint",
         max_open_loop_steps=16,
         save_request_video=False,

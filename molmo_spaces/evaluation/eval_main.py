@@ -651,19 +651,26 @@ def run_evaluation(
             }
         )
 
-    # Create or use provided policy
+    # Create or use provided policy.
+    # Only preload the policy in single-worker mode. With multiple workers, the
+    # policy must be constructed inside each worker because stateful resources
+    # (e.g. Wall-X / PI websocket connections, msgpack buffers) cannot be
+    # pickled and would break when forked.
+    policy: BasePolicy | None
     if preloaded_policy is not None:
         policy = preloaded_policy
-    else:
+    elif num_workers <= 1:
         policy = exp_config.policy_config.policy_cls(exp_config, exp_config.task_type)
-
-    # # Run evaluation
-    # runner = JsonEvalRunner(exp_config, benchmark_dir)
-    # success_count, total_count = runner.run(preloaded_policy=policy)
+    else:
+        log.info(
+            "num_workers=%d > 1: skipping main-process policy construction; "
+            "each worker will build its own policy (required for remote-server "
+            "policies like Wall-X / PI that hold unpicklable websocket state).",
+            num_workers,
+        )
+        policy = None
 
     # Run evaluation
-    # Only pass preloaded policy for single-worker mode. With multiple workers,
-    # each worker must create its own connection (WebSocket/msgpack can't be pickled).
     runner = JsonEvalRunner(exp_config, benchmark_dir)
     success_count, total_count = runner.run(preloaded_policy=policy)
 

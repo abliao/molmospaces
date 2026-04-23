@@ -5,7 +5,7 @@ class PiPolicyConfig(BasePolicyConfig):
     checkpoint_path: str = "checkpoints/pi"
     # remote_config: None -> launch local server
     # or dict(host,port) -> attaches to remote server
-    remote_config: dict | None = dict(host="localhost", port=8080)
+    remote_config: dict | None = dict(host="39.101.65.229", port=32332)
     grasping_type: str = "binary"
     grasping_threshold: float = 0.5
     chunk_size: int = 8
@@ -60,7 +60,7 @@ class CAPPolicyConfig(BasePolicyConfig):
 
 
 class WallXServerAdapterPolicyConfig(BasePolicyConfig):
-    remote_config: dict = dict(host="39.101.65.229", port=40992)
+    remote_config: dict = dict(host="39.101.65.229", port=32178)
     model_name: str = "wallx_server"
     infer_mode: str = "flow"
     return_action_format: str = "native"
