@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import msgpack
 import msgpack_numpy
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -335,7 +336,6 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
             port=remote_config.get("port"),
             connection_timeout=getattr(policy_config, "connection_timeout", None),
         )
-
         # NOTE: pipeline.setup_policy calls policy_cls(exp_config, task) where
         # the second positional arg is a BaseMujocoTask instance (e.g.
         # OpeningTask), not the task-type string. Follow the same pattern as
@@ -752,7 +752,6 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
         payload = {}
         view_sources: dict[str, str] = {}
         view_summaries: dict[str, dict[str, Any]] = {}
-
         front_entry = self._choose_camera_entry(
             obs,
             self.front_camera_keys,
@@ -796,7 +795,6 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
         self._last_view_sources = view_sources
         self._last_view_summaries = view_summaries
         self._maybe_record_request_video_frame(front_image, active_wrist_image)
-
         return payload
 
     def _maybe_record_request_video_frame(
@@ -1058,22 +1056,18 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
                 raise ValueError(
                     f"Wall-X predict_action must be 2D [horizon, dim], got {predict_action_np.shape}"
                 )
-
-            action_keys = response.get("predict_action_keys")
-            action_dims = response.get("predict_action_dims")
+            if self.joint_action_mode == 'delta':
+                predict_action_np[...,:-1] = predict_action_np[...,:-1] + self._current_arm_joint_pos(self._last_obs).astype(np.float32)
+            action_keys = response.get("predict_action")
             if action_keys is None:
                 raise ValueError("Wall-X native response must include predict_action_keys.")
-            if action_dims is None:
-                action_dims = self._infer_action_dims(
-                    action_keys=action_keys,
-                    total_dim=int(predict_action_np.shape[1]),
-                )
+            action_dims = predict_action_np.shape[-1]
 
-            self._update_action_layout(
-                action_keys=action_keys,
-                action_dims=action_dims,
-                total_dim=int(predict_action_np.shape[1]),
-            )
+            # self._update_action_layout(
+            #     action_keys=action_keys,
+            #     action_dims=action_dims,
+            #     total_dim=int(predict_action_np.shape[1]),
+            # )
             execute_horizon = min(self.max_open_loop_steps, int(predict_action_np.shape[0]))
             self._action_buffer = predict_action_np[:execute_horizon].copy()
             self._buffer_index = 0
@@ -1157,20 +1151,7 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
         return np.array([ctrl], dtype=np.float32)
 
     def _decode_joint_arm_action(self, action_row: np.ndarray) -> np.ndarray:
-        arm_slice, arm_key = self._find_action_slice(
-            *_joint_arm_action_candidate_keys(self.joint_action_arm_key)
-        )
-        arm_value = np.asarray(action_row[arm_slice], dtype=np.float32).reshape(-1)
-        joint_action_mode = self.joint_action_mode
-        if joint_action_mode == "auto":
-            if "delta" in arm_key or "relative" in arm_key:
-                joint_action_mode = "delta"
-            else:
-                joint_action_mode = "absolute"
-
-        if joint_action_mode == "delta":
-            current_arm_qpos = self._current_arm_joint_pos(self._last_obs).astype(np.float32)
-            arm_value = current_arm_qpos + arm_value
+        arm_value = action_row[...,:-1].reshape(-1)
 
         try:
             ctrl_limits = np.asarray(
@@ -1184,9 +1165,7 @@ class WallXServerAdapterPolicy(WebsocketPolicy):
         return arm_value.copy()
 
     def _decode_joint_gripper_action(self, action_row: np.ndarray) -> np.ndarray:
-        grip_slice, _ = self._find_action_slice(self.joint_action_gripper_key)
-        grip_value = float(np.asarray(action_row[grip_slice], dtype=np.float64).reshape(-1)[0])
-
+        grip_value = float(action_row[...,-1].reshape(-1)[0])
         if self.joint_gripper_scalar_mode == "normalized_open":
             open_fraction = float(np.clip(grip_value, 0.0, 1.0))
             ctrl = self.closed_gripper_ctrl + open_fraction * (

@@ -3,11 +3,36 @@ from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
 
 
-def _ensure_nltk():
-    import nltk
+def _ensure_nltk() -> None:
+    """Ensure WordNet corpora exist locally without hitting the network when already installed.
 
-    for corpus in ["wordnet", "wordnet2022"]:
-        nltk.download(corpus)
+    Unconditional ``nltk.download`` refreshes the remote package index, which fails behind
+    some proxies/VPNs (e.g. SSRF warnings / non-XML responses) and breaks multiprocessing
+    workers that re-import this module.
+    """
+    import logging
+
+    import nltk
+    from nltk.data import find
+
+    log = logging.getLogger(__name__)
+    # Paths NLTK registers for these packages (see nltk.corpus.util.LazyCorpusLoader)
+    needed = [
+        ("wordnet", "corpora/wordnet"),
+        ("wordnet2022", "corpora/wordnet2022"),
+    ]
+    for package_id, resource_path in needed:
+        try:
+            print(f"NLTK {resource_path} {package_id} trying to find")
+            find(resource_path)
+            print(f"NLTK {package_id} found")
+        except LookupError:
+            print(f"NLTK {package_id} not found")
+            try:
+                nltk.download(package_id, quiet=True)
+            except Exception as e:
+                log.warning("NLTK download failed for %s: %s", package_id, e)
+                # raise
 
 
 _ensure_nltk()

@@ -99,6 +99,27 @@ CONSOLIDATED_TRAJECTORIES_SUFFIX = "_batch_1_of_1"
 PARTIAL_DIR_NAME = "_partial"
 
 
+def _allocate_house_subdir_name(output_dir: Path, house_id: int) -> str:
+    """Pick a non-colliding run directory name under ``output_dir``.
+
+    Uses ``house_{id}`` if that path does not exist; otherwise ``house_{id}_1``,
+    ``house_{id}_2``, ... so repeated ``house_id`` work items in one run (or
+    across runs sharing the same ``output_dir``) do not clobber outputs.
+
+    Note: check-then-use is not fully race-safe under parallel workers; rare
+    duplicate picks are possible if two processes pass the check simultaneously.
+    """
+    base = f"house_{house_id}"
+    if not (output_dir / base).exists():
+        return base
+    k = 1
+    while True:
+        name = f"house_{house_id}_{k}"
+        if not (output_dir / name).exists():
+            return name
+        k += 1
+
+
 def setup_house_dirs(
     exp_config: "MlSpacesExpConfig",
     house_id: int,
@@ -124,10 +145,17 @@ def setup_house_dirs(
         - should_skip is True when EITHER the final consolidated file already
           exists (whole house done) OR the per-batch partial pkl already exists
           (this specific batch was already recorded by a previous run).
+        - If ``allocate_unique_house_subdirs`` is True and ``house_{house_id}`` already
+          exists under ``output_dir``, uses the first free name among
+          ``house_{house_id}_1``, ``house_{house_id}_2``, ... (data generation only).
     """
-    house_output_dir = exp_config.output_dir / f"house_{house_id}"
+    if exp_config.allocate_unique_house_subdirs:
+        house_subdir = _allocate_house_subdir_name(exp_config.output_dir, house_id)
+    else:
+        house_subdir = f"house_{house_id}"
+    house_output_dir = exp_config.output_dir / house_subdir
     debug_base_dir = exp_config.output_dir.parent / "debug" / exp_config.output_dir.name
-    house_debug_dir = debug_base_dir / f"house_{house_id}"
+    house_debug_dir = debug_base_dir / house_subdir
 
     # Always use a consolidated suffix; every batch for the same house writes to
     # the same final file via record+finalize.
@@ -1797,20 +1825,28 @@ class ParallelRolloutRunner:
         # Start timing for WandB metrics
         start_time = time.time()
 
+        # B2: Optional process recycling to reclaim native memory (MuJoCo model compilation,
+        # renderer, etc.). Set MLSPACES_MAX_HOUSES_PER_WORKER=N to have each worker exit
+        # after N houses. The main process then spawns a fresh worker to take over.
+        # Parsed up-front so it also applies when num_workers == 1 (which otherwise would
+        # take the in-process synchronous fast-path and never recycle memory).
+        max_houses_per_worker_env = os.environ.get("MLSPACES_MAX_HOUSES_PER_WORKER", "").strip()
+        max_houses_per_worker: int | None = None
+        if max_houses_per_worker_env:
+            try:
+                max_houses_per_worker = int(max_houses_per_worker_env)
+            except ValueError:
+                self.logger.warning(
+                    f"Invalid MLSPACES_MAX_HOUSES_PER_WORKER='{max_houses_per_worker_env}', ignoring."
+                )
+                max_houses_per_worker = None
+
+        # Force multi-process path whenever recycling is requested, even with num_workers=1,
+        # so the worker can be killed-and-restarted between houses to reclaim native memory.
+        use_subprocess_workers = self.config.num_workers > 1 or max_houses_per_worker is not None
+
         # Launch worker processes
-        if self.config.num_workers > 1:
-            # B2: Optional process recycling to reclaim native memory (MuJoCo model compilation, renderer, etc.)
-            # Set MLSPACES_MAX_HOUSES_PER_WORKER=N to have each worker exit after N houses.
-            max_houses_per_worker_env = os.environ.get("MLSPACES_MAX_HOUSES_PER_WORKER", "").strip()
-            max_houses_per_worker: int | None = None
-            if max_houses_per_worker_env:
-                try:
-                    max_houses_per_worker = int(max_houses_per_worker_env)
-                except ValueError:
-                    self.logger.warning(
-                        f"Invalid MLSPACES_MAX_HOUSES_PER_WORKER='{max_houses_per_worker_env}', ignoring."
-                    )
-                    max_houses_per_worker = None
+        if use_subprocess_workers:
 
             processes: list[mp_context.Process] = []
             next_worker_id = 0

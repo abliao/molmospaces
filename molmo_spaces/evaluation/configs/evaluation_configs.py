@@ -231,24 +231,24 @@ class WallXServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
 class WallXJointServerAdapterEvalConfig(JsonBenchmarkEvalConfig):
     robot_config: FrankaRobotConfig = FrankaRobotConfig()
     policy_config: WallXServerAdapterPolicyConfig = WallXServerAdapterPolicyConfig(
-        remote_config=dict(host="39.101.65.229", port=32178),
+        remote_config=dict(host="39.101.65.229", port=32177),
         wallx_io_mode="joint",
         max_open_loop_steps=16,
         save_request_video=False,
-        front_camera_payload_key="face_view",
-        left_wrist_payload_key="left_wrist_view",
+        front_camera_payload_key="camera_front",
+        left_wrist_payload_key="camera_left",
         right_wrist_payload_key="right_wrist_view",
         wallx_joint_state_arm_key="follow_left_arm_joint_pos",
         wallx_joint_state_gripper_key="follow_left_gripper",
         wallx_joint_action_arm_key="master_left_arm_joint_pos",
         wallx_joint_action_gripper_key="master_left_gripper",
         wallx_joint_action_mode="absolute",
-        wallx_joint_gripper_scalar_mode="normalized_open",
+        wallx_joint_gripper_scalar_mode="binary",
     )
     # DROID trajectories are recorded at 15 FPS (~66.7 ms per step). Use 66 ms
     # here because policy_dt_ms must be an integer multiple of ctrl_dt_ms (2 ms).
     policy_dt_ms: float = 66.0
-
+    end_on_success: bool = True
     def model_post_init(self, __context):
         super().model_post_init(__context)
         self.robot_config.action_noise_config.enabled = False

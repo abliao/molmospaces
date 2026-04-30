@@ -23,6 +23,7 @@ from molmo_spaces.configs.camera_configs import (
     FrankaEasyRandomizedDroidCameraSystem,
     FrankaGoProD405D455CameraSystem,
     FrankaOmniPurposeCameraSystem,
+    FrankaOmniShoulderWristRgbCameraSystem,
     FrankaRandomizedD405D455CameraSystem,
     FrankaRandomizedDroidCameraSystem,
     RBY1GoProD455CameraSystem,
@@ -234,10 +235,12 @@ class FrankaOpenDataGenConfig(OpeningBaseConfig):
     scene_dataset: str = "ithor"  # Name of the scene dataset to load
     data_split: str = "train"  # Data split to use
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniShoulderWristRgbCameraSystem = FrankaOmniShoulderWristRgbCameraSystem()
     task_sampler_config: OpenTaskSamplerConfig = OpenTaskSamplerConfig(
         task_sampler_class=OpenTaskSampler,
         target_initial_state_open_percentage=0,  # 0.67 for close task, 0 for open task
+        samples_per_house=4,
+        house_inds= list(range(0, 4)) *25
     )
     policy_config: BasePolicyConfig = OpenClosePlannerPolicyConfig()
     task_horizon: int | None = 200  # Maximum number of steps per episode (if None, no time limit)
@@ -473,10 +476,12 @@ class FrankaCloseDataGenConfig(ClosingBaseConfig):
     scene_dataset: str = "ithor"  # Name of the scene dataset to load
     data_split: str = "train"  # Data split to use
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniShoulderWristRgbCameraSystem = FrankaOmniShoulderWristRgbCameraSystem()
     task_sampler_config: OpenTaskSamplerConfig = OpenTaskSamplerConfig(
         task_sampler_class=OpenTaskSampler,
         target_initial_state_open_percentage=0.5,  # 0.67 for close task, 0 for open task
+        samples_per_house=4,
+        house_inds= list(range(0, 4)) *25
     )
     task_horizon: int | None = 200  # Maximum number of steps per episode (if None, no time limit)
     output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "close_v1"
@@ -602,10 +607,10 @@ class FrankaPickDroidMiniBench(PickBaseConfig):
     scene_dataset: str = "procthor-10k"
     data_split: str = "val"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniShoulderWristRgbCameraSystem = FrankaOmniShoulderWristRgbCameraSystem()
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        samples_per_house=40,
+        samples_per_house=4,
         house_inds=list(range(101)),
     )
     output_dir: Path = ASSETS_DIR / "benchmark" / "pick_droid_v1"
@@ -620,11 +625,11 @@ class FrankaPickandPlaceDroidMiniBench(PickAndPlaceDataGenConfig):
     scene_dataset: str = "procthor-10k"
     data_split: str = "val"
     robot_config: BaseRobotConfig = FrankaRobotConfig()
-    camera_config: FrankaOmniPurposeCameraSystem = FrankaOmniPurposeCameraSystem()
+    camera_config: FrankaOmniShoulderWristRgbCameraSystem = FrankaOmniShoulderWristRgbCameraSystem()
     task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
         task_sampler_class=PickAndPlaceTaskSampler,
         pickup_types=PICK_AND_PLACE_OBJECTS,
-        samples_per_house=40,
+        samples_per_house=4,
         house_inds=list(range(101)),
     )
     output_dir: Path = ASSETS_DIR / "benchmark" / "pick_and_place_droid_v1"
@@ -642,7 +647,7 @@ class FrankaPickDroidBench(PickBaseConfig):
     camera_config: FrankaDroidCameraSystem = FrankaDroidCameraSystem()
     task_sampler_config: PickTaskSamplerConfig = PickTaskSamplerConfig(
         task_sampler_class=PickTaskSampler,
-        samples_per_house=40,
+        samples_per_house=4,
         house_inds=list(range(101)),
     )
     output_dir: Path = ASSETS_DIR / "benchmark" / "pick_obja_v1"
@@ -661,7 +666,7 @@ class FrankaPickandPlaceDroidBench(PickAndPlaceDataGenConfig):
     task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
         task_sampler_class=PickAndPlaceTaskSampler,
         pickup_types=PICK_AND_PLACE_OBJECTS,
-        samples_per_house=40,
+        samples_per_house=4,
         house_inds=list(range(101)),
     )
     output_dir: Path = ASSETS_DIR / "benchmark" / "pick_and_place_obja_v1"

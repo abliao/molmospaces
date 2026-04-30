@@ -516,6 +516,41 @@ class FrankaOmniPurposeCameraSystem(CameraSystemConfig):
     ]
 
 
+class FrankaOmniShoulderWristRgbCameraSystem(CameraSystemConfig):
+    """Minimal RGB-only pick datagen: one third-person (shoulder) + one wrist, same names as Omni.
+
+    Omits all randomized exocentric cameras and disables wrist depth so MuJoCo does not
+    render or save extra views (faster, smaller artifacts). Use this when you only need
+    `droid_shoulder_light_randomization` + `wrist_camera_zed_mini` RGB.
+    """
+
+    img_resolution: tuple[int, int] = (624, 352)
+    cameras: list[AllCameraTypes] = [
+        MjcfCameraConfig(
+            name="wrist_camera_zed_mini",
+            mjcf_name="gripper/wrist_camera",
+            robot_namespace="robot_0/",
+            fov=52.0,
+            fov_noise_degrees=(-4.0, 4.0),
+            pos_noise_range=((-0.015, -0.005, -0.02), (0.015, 0.005, 0.02)),
+            orientation_noise_degrees=(8.0, 4.0, 4.0),
+            record_depth=False,
+        ),
+        RobotMountedCameraConfig(  # third-person / DROID-style shoulder
+            name="droid_shoulder_light_randomization",
+            reference_body_names=["robot_0/fr3_link0"],
+            camera_offset=[0.1, 0.57, 0.66],
+            camera_quaternion=[-0.3633, -0.1241, 0.4263, 0.8191],
+            fov=71.0,
+            pos_noise_range=(-0.001, 0.001),
+            orientation_noise_degrees=8.0,
+            visibility_constraints={
+                "__task_objects__": 0.001,
+            },
+        ),
+    ]
+
+
 class FrankaRandomizedDroidCameraSystem(CameraSystemConfig):
     """Camera system for Franka DROID system with wrist cam (ZED mini) and 2 randomized exo cams (ZED 2/ZED 2i).
 

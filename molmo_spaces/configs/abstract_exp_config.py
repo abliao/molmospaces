@@ -80,6 +80,9 @@ class MlSpacesExpConfig(Config, ABC):
 
     # Output and profiling
     output_dir: Path  # Output directory for experiment results
+    # When True, data generation picks non-colliding subdirs (house_{id}_1, ...) if house_{id}
+    # already exists under output_dir. Eval stays on house_{id} only (default False).
+    allocate_unique_house_subdirs: bool = False
     profile: bool = False  # Whether to enable profiling
     profiler: Profiler | None = None  # Profiler instance (auto-created if profile=True)
     datagen_profiler: bool = True  # run the datagen profiler
